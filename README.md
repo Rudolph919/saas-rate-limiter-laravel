@@ -1,7 +1,7 @@
 # SaaS Rate Limiter (Laravel)
 
 [![Tests](https://github.com/Rudolph919/saas-rate-limiter-laravel/actions/workflows/tests.yml/badge.svg)](https://github.com/Rudolph919/saas-rate-limiter-laravel/actions/workflows/tests.yml)
-[![PHP](https://img.shields.io/badge/PHP-8.3%2B-777BB4?logo=php&logoColor=white)](composer.json)
+[![PHP](https://img.shields.io/badge/PHP-8.4%2B-777BB4?logo=php&logoColor=white)](composer.json)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 Tiered, per-tenant rate-limiting middleware for a multi-tenant API — stops one noisy client from starving everyone else's quota.
@@ -39,7 +39,7 @@ Both limits are checked on every non-exempt request, **client first, then endpoi
 
 ## Requirements
 
-- PHP 8.3+
+- PHP 8.4.1+
 - Composer
 
 ## Setup
