@@ -2,51 +2,56 @@
 
 namespace App\Services\RateLimiting;
 
+use App\Services\RateLimiting\Stores\CounterStore;
+
+/**
+ * Fixed-window rate limit accounting.
+ *
+ * Window boundaries are aligned to the epoch (intdiv(timestamp, windowSeconds) * windowSeconds)
+ * so every process agrees on where a window starts without coordinating. The known trade-off is
+ * boundary burst: a client can spend its full quota at the end of one window and again at the
+ * start of the next, so the real worst case is 2x the configured limit over a short span. A
+ * sliding window counter is the fix; it is deliberately out of scope here.
+ *
+ * Where the counts actually live is the store's problem, not this class's — see CounterStore.
+ */
 class RateLimitCounter
 {
-    /**
-     * @var array<string, array{window_start: int, count: int}>
-     */
-    private array $store = [];
+    public function __construct(private readonly CounterStore $store) {}
 
     public function attempt(ResolvedLimit $limit, ?int $now = null): RateLimitResult
     {
         $now ??= time();
         $windowStart = $this->windowStart($now, $limit->windowSeconds);
-        $state = $this->store[$limit->key] ?? null;
 
-        if ($state === null || $state['window_start'] !== $windowStart) {
-            $state = [
-                'window_start' => $windowStart,
-                'count' => 0,
-            ];
-        }
-
-        $state['count']++;
-        $this->store[$limit->key] = $state;
+        $count = $this->store->increment(
+            key: $limit->key,
+            windowStart: $windowStart,
+            ttlSeconds: $limit->windowSeconds,
+            now: $now,
+        );
 
         $retryAfterSeconds = ($windowStart + $limit->windowSeconds) - $now;
-        $allowed = $state['count'] <= $limit->maxRequests;
 
         return new RateLimitResult(
-            allowed: $allowed,
+            allowed: $count <= $limit->maxRequests,
             key: $limit->key,
             type: $limit->type,
             name: $limit->name,
             maxRequests: $limit->maxRequests,
-            currentCount: $state['count'],
+            currentCount: $count,
             retryAfterSeconds: max(1, $retryAfterSeconds),
         );
     }
 
     public function reset(): void
     {
-        $this->store = [];
+        $this->store->reset();
     }
 
     public function entryCount(): int
     {
-        return count($this->store);
+        return $this->store->entryCount();
     }
 
     private function windowStart(int $timestamp, int $windowSeconds): int

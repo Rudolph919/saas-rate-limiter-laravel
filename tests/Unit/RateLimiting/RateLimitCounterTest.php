@@ -4,6 +4,7 @@ namespace Tests\Unit\RateLimiting;
 
 use App\Services\RateLimiting\RateLimitCounter;
 use App\Services\RateLimiting\ResolvedLimit;
+use App\Services\RateLimiting\Stores\ArrayStore;
 use PHPUnit\Framework\Attributes\TestWith;
 use Tests\TestCase;
 
@@ -15,7 +16,7 @@ class RateLimitCounterTest extends TestCase
     {
         parent::setUp();
 
-        $this->counter = new RateLimitCounter;
+        $this->counter = new RateLimitCounter(new ArrayStore);
     }
 
     public function test_first_request_is_allowed(): void

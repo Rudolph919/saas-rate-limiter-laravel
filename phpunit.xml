@@ -28,6 +28,10 @@
         <env name="DB_URL" value=""/>
         <env name="MAIL_MAILER" value="array"/>
         <env name="QUEUE_CONNECTION" value="sync"/>
+        <!-- One process per test run, so the array store is both correct and deterministic
+             here. SharedMemoryStore is covered directly by SharedMemoryStoreTest, and the
+             real cross-request behaviour is asserted over HTTP by scripts/demo-rate-limits.sh. -->
+        <env name="RATE_LIMIT_STORE" value="array"/>
         <env name="SESSION_DRIVER" value="array"/>
         <env name="PULSE_ENABLED" value="false"/>
         <env name="TELESCOPE_ENABLED" value="false"/>

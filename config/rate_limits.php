@@ -21,6 +21,44 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Counter Store
+    |--------------------------------------------------------------------------
+    |
+    | Where fixed-window counters live. This is the setting that decides whether
+    | the limiter works at all.
+    |
+    | - shared_memory: System V shared memory + semaphore. Counters survive across
+    |                  requests and are shared by every PHP-FPM worker on the host.
+    |                  This is the only option that enforces limits over real HTTP
+    |                  under PHP's share-nothing request model.
+    | - array:         Plain PHP array, scoped to one request. Enforces NOTHING in a
+    |                  normal deployment — the container is rebuilt per request, so the
+    |                  array is always empty. Correct only for tests, or for a
+    |                  persistent-worker runtime such as Laravel Octane.
+    | - auto:          shared_memory when the sysvshm/sysvsem extensions are loaded,
+    |                  array otherwise.
+    |
+    | Tests force 'array' via phpunit.xml so they stay deterministic and do not
+    | leak counters between runs.
+    |
+    */
+    'store' => [
+        'driver' => env('RATE_LIMIT_STORE', 'auto'),
+
+        'shared_memory' => [
+            // Single character; combined with the app path by ftok() to derive the
+            // System V key. Change it to give a second app on the same host its own
+            // segment.
+            'project_id' => env('RATE_LIMIT_SHM_PROJECT_ID', 'r'),
+
+            // Fixed segment size. Holds roughly a few thousand (org, limit) pairs;
+            // when full the store drops all counters rather than failing requests.
+            'segment_bytes' => (int) env('RATE_LIMIT_SHM_BYTES', 1048576),
+        ],
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
     | Time Window
     |--------------------------------------------------------------------------
     |

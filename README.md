@@ -17,7 +17,7 @@ A single tenant's automated sync job was consuming roughly 40% of a shared API's
 Incoming `/api/*` requests pass through `RateLimitMiddleware`, which delegates to two services:
 
 1. **`RateLimitResolver`** — reads `X-Org-Id`, maps the org to a tier, matches the HTTP method + path against `config/rate_limits.php`, and returns up to two limits: one per-client ceiling and one per-endpoint rule.
-2. **`RateLimitCounter`** — an in-memory fixed-window store. Each limit has a key like `client:org_acme` or `endpoint:org_acme:create_item`, tracking `{ count, window_start }`.
+2. **`RateLimitCounter`** — fixed-window accounting over a `CounterStore`. Each limit has a key like `client:org_acme` or `endpoint:org_acme:create_item`. Counters live in **System V shared memory**, which is what makes them survive from one request to the next under PHP's share-nothing model — see [Where counters live](#where-counters-live).
 
 Both limits are checked on every non-exempt request, **client first, then endpoint** — the first failure returns `429` with which limit tripped and a `Retry-After` header. Missing `X-Org-Id` is a `401` (an identity problem, not a quota problem). Write endpoints are stricter than reads on the same path.
 
@@ -41,6 +41,9 @@ Both limits are checked on every non-exempt request, **client first, then endpoi
 
 - PHP 8.4.1+
 - Composer
+- The `sysvshm` and `sysvsem` extensions (bundled with most PHP builds, including Herd and the
+  official Docker images). Without them the app falls back to the array store and **enforces
+  nothing** — see [Where counters live](#where-counters-live).
 
 ## Setup
 
@@ -138,13 +141,17 @@ saas-rate-limiter-laravel/
 │   Http/
 │   │   Controllers/ApiController.php      # Sample API handlers
 │   │   Middleware/RateLimitMiddleware.php  # Entry point
-│   Providers/AppServiceProvider.php        # Counter singleton
+│   Providers/AppServiceProvider.php        # Store driver selection
 │   Services/RateLimiting/
 │       RateLimitResolver.php               # Config → limits
-│       RateLimitCounter.php                # Fixed-window store
+│       RateLimitCounter.php                # Fixed-window accounting
 │       ResolvedLimit.php                   # DTO
 │       RateLimitResolution.php             # DTO
 │       RateLimitResult.php                 # DTO
+│       Stores/
+│           CounterStore.php                # Interface (Redis drops in here)
+│           SharedMemoryStore.php           # SysV shared memory + semaphore
+│           ArrayStore.php                  # Per-request; tests only
 ├── bootstrap/app.php                       # Middleware registration
 ├── config/rate_limits.php                  # All limits (no code changes)
 └── routes/api.php                          # Sample routes
@@ -169,20 +176,69 @@ RateLimitMiddleware
 
 No rate-limiting logic appears in routes or controllers — all enforcement lives in the middleware, and every threshold is config-driven (`config/rate_limits.php`), so tuning a limit never touches application code.
 
-**Algorithm:** fixed window, boundaries aligned to epoch (`intdiv(timestamp, windowSeconds) * windowSeconds`). Simplest correct implementation, at the cost of boundary bursts — a client can send a full quota at the end of one window and again at the start of the next. `RateLimitCounter` is a plain in-process array, which is safe here because the counter is a singleton within a single PHP process.
+**Algorithm:** fixed window, boundaries aligned to epoch (`intdiv(timestamp, windowSeconds) * windowSeconds`). Simplest correct implementation, at the cost of boundary bursts — a client can send a full quota at the end of one window and again at the start of the next, so the real worst case is 2× the configured limit over a short span.
 
 **Endpoint rule matching** is hand-rolled path-wildcard matching evaluated top-to-bottom (first match wins) — fine for a handful of routes, but in a larger app I'd move to route-name-based limits to avoid order-dependent config.
 
+## Where counters live
+
+This is the part worth reading, because the first version of this project got it wrong.
+
+Counters were originally a plain PHP array on a `RateLimitCounter` singleton bound into the
+service container. Every test passed. Over real HTTP it enforced **nothing** — 30 consecutive
+requests against a 10/minute limit all returned `200`.
+
+PHP is share-nothing: Laravel rebuilds the service container on every request, so a
+"singleton" is really scoped to one request. The array was empty each time and every request
+counted to 1. The test suite could not see it, because PHPUnit runs a whole test method in a
+single process against a single booted container — so there the array genuinely did survive
+between calls. **The tests and the production path had different state lifetimes, and only the
+lifetime that worked was ever tested.**
+
+The fix is `CounterStore`, an interface with one meaningful operation — "increment this key in
+this window and tell me the new count", atomically:
+
+| Driver | State lives in | Use it for |
+|---|---|---|
+| `shared_memory` (default) | System V shared memory segment, guarded by a semaphore | Real deployments. Kernel-owned, so it outlives both the request and the PHP worker, and is shared by every FPM worker on the host. |
+| `array` | A PHP array on the object | Tests, or a persistent-worker runtime (Octane, RoadRunner, FrankenPHP) where the container really does outlive the request. |
+
+Select with `RATE_LIMIT_STORE` or `rate_limits.store.driver`; `auto` (the default) picks
+`shared_memory` when the extensions are present. No Redis, no database, no external cache — the
+in-memory constraint still holds.
+
+**What this buys, and what it does not:**
+
+- Counters are shared across all workers **on one host**. Behind a load balancer with N hosts,
+  an org's effective limit is still roughly N × configured. Only a shared store fixes that.
+- Counters now **survive an application restart**, since the segment belongs to the kernel. That
+  is a deliberate change: abuse state should not reset because someone deployed.
+- Expired `(key, window)` entries are pruned on write, so the map stays bounded. If the segment
+  fills anyway, the store drops all counters and continues rather than failing requests —
+  bounded memory, at the cost of one forgiving window.
+- Serialising the whole map per request is the main scaling ceiling, and the clearest argument
+  for moving to Redis, where `INCR` touches exactly one key.
+
+**How this is prevented from regressing:** an in-process test structurally cannot catch a
+state-lifetime bug — it shares a process with the code under test. Two things guard it now.
+`SharedMemoryStoreTest` throws the store away and builds a new one between increments, which is
+what a second HTTP request does. And `scripts/demo-rate-limits.sh` makes real HTTP requests and
+**exits non-zero** if the limit never trips — the old version printed 22 success lines and
+exited 0 while the feature was dead.
+
 ## AI collaboration
 
-Built with AI assistance, with a few corrections along the way. The one worth calling out: the AI's first pass sent every request with a missing or unrecognized `X-Org-Id` into a single shared "unknown" bucket. That recreates the exact noisy-neighbor bug this middleware exists to prevent — all anonymous clients would fight over one counter. The fix: a missing header is a `401` before rate limiting even runs; an unrecognized org ID still gets its own counter key on the default tier.
+Built with AI assistance, with a few corrections along the way.
+
+**Caught during review:** the AI's first pass sent every request with a missing or unrecognized `X-Org-Id` into a single shared "unknown" bucket. That recreates the exact noisy-neighbor bug this middleware exists to prevent — all anonymous clients would fight over one counter. The fix: a missing header is a `401` before rate limiting even runs; an unrecognized org ID still gets its own counter key on the default tier.
+
+**Missed during review, caught by running it:** the in-process array counter described in [Where counters live](#where-counters-live). Both the AI and I reasoned about it as "a singleton, so it persists," and the green test suite agreed. It took actually hammering a running server to find out otherwise. The lesson generalises past this bug — reviewing generated code by reading it will not catch assumptions that are only wrong at runtime.
 
 ## What I'd change for production
 
 - **Real auth before rate limiting** — the middleware currently trusts whatever `X-Org-Id` a caller sends. In production, resolve the org server-side from an API key/OAuth/JWT credential, never from a client-supplied header.
-- **Redis-backed counters** — the in-memory store is per-process: a restart wipes all counters, and with N server instances an org's effective limit becomes roughly N × configured, since each instance counts independently. Redis with TTL = `window_seconds` fixes both.
+- **Redis-backed counters** — shared memory is per host, so with N hosts behind a load balancer an org's effective limit is still roughly N × configured. A `RedisStore` implementing `CounterStore` (`INCR` + `EXPIRE`, or a small Lua script to make the pair atomic) fixes that, and nothing above the interface changes. It also removes the whole-map serialisation cost.
 - **Sliding window (or token bucket)** instead of fixed window, to remove the boundary-burst edge case.
-- **Memory bound on the counter map** — nothing evicts stale keys today; with enough orgs × endpoints this grows unbounded in a long-lived process. TTL eviction or an LRU cap would address it.
 - **Metrics** — 429 rate by org, counter map size, p99 latency before/after the middleware.
 
 ## Tests
@@ -191,14 +247,25 @@ Built with AI assistance, with a few corrections along the way. The one worth ca
 php artisan test
 ```
 
-**36 tests** covering:
+**42 tests** covering:
 
 | Area | File |
 |------|------|
 | Resolver (org, tier, paths, exempt) | `tests/Unit/RateLimiting/RateLimitResolverTest.php` |
 | Counter (windows, Retry-After, burst) | `tests/Unit/RateLimiting/RateLimitCounterTest.php` |
+| Store lifetime, pruning, isolation | `tests/Unit/RateLimiting/SharedMemoryStoreTest.php` |
 | Middleware (401, 429, tiers) | `tests/Feature/RateLimitMiddlewareTest.php` |
 | Noisy-tenant demo scenario | `tests/Feature/RateLimitDemoTest.php` |
+
+The suite forces the `array` driver (see `phpunit.xml`) so runs stay deterministic and never
+leave counters behind. That means **`php artisan test` alone cannot prove the limiter works** —
+it runs in one process, where even the broken array store looks correct. Run the demo script
+against a live server for that:
+
+```bash
+php artisan serve &
+./scripts/demo-rate-limits.sh    # exits non-zero if limits are not enforced
+```
 
 ## License
 
