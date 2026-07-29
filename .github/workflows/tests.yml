@@ -17,6 +17,11 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: "8.4"
+          # The limiter stores counters in a System V shared memory segment; without these
+          # the app falls back to the array store and enforces nothing. Requested explicitly
+          # rather than assumed, so a missing extension fails here with a clear message
+          # instead of surfacing as a confusing demo-script failure later.
+          extensions: sysvshm, sysvsem
           coverage: none
 
       - name: Install dependencies
@@ -30,3 +35,29 @@ jobs:
 
       - name: Run tests
         run: php artisan test
+
+      # php artisan test cannot prove this limiter works. The suite runs in a single process
+      # against a single booted container, which is precisely the condition under which the
+      # original per-request array counter looked correct while enforcing nothing over HTTP.
+      # The only check that catches that regression is real requests to a real server.
+      - name: Start server
+        run: |
+          php artisan serve --port=8000 > /tmp/serve.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8000/api/health; then
+              echo "Server is up after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start within 30s"
+          cat /tmp/serve.log
+          exit 1
+
+      # Exits non-zero if limits are not enforced, or if one tenant's 429s leak into another's.
+      - name: Verify rate limiting over HTTP
+        run: ./scripts/demo-rate-limits.sh
+
+      - name: Dump server log on failure
+        if: failure()
+        run: cat /tmp/serve.log 2>/dev/null || true
